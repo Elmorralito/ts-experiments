@@ -1,0 +1,19 @@
+[tool.poetry]
+name = "ts-experiments"
+version = "0.1.0"
+description = "Time series experiments"
+authors = [
+    "Elmorralito <drestrepohinc@gmail.com>"
+]
+readme = "README.md"
+license = "MIT"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = ">=3.12,<3.14"
+codon-jit = "^0.4.4"
+ts-piggies = { path = "./piggies", develop = true }
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
