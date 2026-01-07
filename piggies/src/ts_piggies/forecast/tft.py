@@ -62,7 +62,6 @@ class TFTForecastWrapper(ForecastModelWrapper):
             min_prediction_length=1,
             max_prediction_length=self.max_prediction_length,
             static_categoricals=["series_id"],
-            static_reals=[],
             time_varying_known_reals=[
                 "year",
                 "month",

@@ -1,8 +1,8 @@
-import itertools
 import logging
+import random
 from enum import Enum
-from itertools import product
-from typing import Any, Dict, Iterator, List, Literal, Self, Type
+from itertools import islice, product
+from typing import Any, Callable, Dict, Iterator, List, Literal, Self, Type
 
 import numpy as np
 import pandas as pd
@@ -13,26 +13,14 @@ from sklearn.metrics import (
     mean_squared_error,
 )
 
-from .abstract import (  # ProbabilisticForecastResult,
+from .abstract import (
     AbstractModelWrapperConfig,
     ForecastModelWrapper,
     ForecastResult,
+    ProbabilisticForecastResult,
 )
 
 logger = logging.getLogger(__name__)
-
-
-class GridSearchConfig(BaseModel):
-
-    error_metric: Literal["MAE", "MAPE", "MASE"] = "MAE"
-    validation_length: float = Field(default=0.2, ge=0.0, le=1.0)
-    config_type: Type[AbstractModelWrapperConfig]
-    model_type: Type[ForecastModelWrapper]
-    quantiles: List[float] = [0.1, 0.25, 0.5, 0.75, 0.9]
-    hyperparameter_grid: Dict[str, List[Any]]
-    max_encoder_length: int
-    max_prediction_length: int
-    n_simulations: int = 1000
 
 
 class ErrorMetric(Enum):
@@ -76,6 +64,23 @@ class ErrorMetric(Enum):
         return metric(y_true, y_pred, multioutput=multioutput)
 
 
+class GridSearchConfig(BaseModel):
+
+    config_type: Type[AbstractModelWrapperConfig]
+    model_type: Type[ForecastModelWrapper]
+    hyperparameter_grid: Dict[str, List[Any]]
+    segment_columns: List[str]
+    sort_columns: List[str]
+    test_column: str
+    max_encoder_length: int
+    max_prediction_length: int
+    sort_ascending: bool = True
+    n_simulations: int = 1000
+    error_metric: ErrorMetric = ErrorMetric.MAE
+    validation_length: float = Field(default=0.2, ge=0.01, le=0.35)
+    quantiles: List[float] = [0.1, 0.25, 0.5, 0.75, 0.9]
+
+
 class GridSearch:
 
     __slots__ = (
@@ -92,16 +97,23 @@ class GridSearch:
         config: GridSearchConfig,
         error_multioutput: Literal["uniform_average", "raw_values"] = "uniform_average",
     ):
+        if not isinstance(config, GridSearchConfig):
+            raise ValueError("config must be a GridSearchConfig")
+
+        if not isinstance(data, pd.DataFrame) or getattr(data, "empty", True):
+            raise ValueError("data must be a pandas DataFrame")
+
         self.data = data
         self.config = config
         self.best_model_config: AbstractModelWrapperConfig | None = None
         self.best_model_error: np.float64 = np.inf
         self.error_multioutput = error_multioutput
 
-    def fit_predict(self) -> ForecastResult:
+    def fit_predict(self) -> ForecastResult | ProbabilisticForecastResult:
         if self.best_model_config is None:
             raise ValueError("No best model found")
 
+        logger.info("Training model with full data...")
         model = self.config.model_type(
             data=self.data,
             config=self.best_model_config,
@@ -110,24 +122,40 @@ class GridSearch:
             n_simulations=self.config.n_simulations,
         )
         logger.info("Fitting and predicting model with config:\n%s", model.config)
-        return model.fit_predict(*self.config.quantiles)
+        return model.fit_predict(*self.config.quantiles, simulations=True)
 
     def search(
         self, max_models: int | None = None, random_sample: bool = False
     ) -> Self:
-        prediction_length = len(self.validation_data.index)
-        logger.info("Starting grid search with %s models", max_models or "all")
-        for idx, config in enumerate(itertools.islice(self.grid, max_models)):
+        prediction_length = int(
+            self.config.validation_length
+            * len(self.data.index)
+            / len(self.data[self.config.segment_columns].drop_duplicates().index)
+        )
+        training_data = self.training_data
+        logger.info(
+            "Starting grid search with %s models with validation length of %s and training data length of %s",
+            max_models or "all",
+            prediction_length,
+            len(training_data.index),
+        )
+        logger.info("Prediction length: %s for validation.", prediction_length)
+        if random_sample:
+            random.seed(42)
+            shuffled = iter(random.sample(list(self.grid), max_models))
+        else:
+            shuffled = self.grid
+
+        for idx, config in enumerate(islice(shuffled, max_models)):
             logger.info("Validating iteration %s of %s", idx + 1, max_models or "all")
             model = self.config.model_type(
-                data=self.training_data,
+                data=training_data,
                 config=config,
                 max_encoder_length=self.config.max_encoder_length,
                 max_prediction_length=prediction_length,
                 n_simulations=self.config.n_simulations,
             )
             error = self.validate(model)
-            logger.debug("Error: %s", error)
             if error < self.best_model_error:
                 logger.info("New best error: %s for config: %s", error, config)
                 self.best_model_error = error
@@ -140,24 +168,74 @@ class GridSearch:
 
     def validate(self, model: ForecastModelWrapper) -> np.float64:
         logger.debug("Validating model config: %s", model.config)
-        testing_data = model.fit_predict(*self.config.quantiles)
+        testing_data = model.fit_predict(*self.config.quantiles, simulations=False)
         logger.debug(
             "Calculating error, using error metric: %s", self.config.error_metric
         )
-        error = self.config.error_metric.calculate_error(
-            self.validation_data.values,
-            testing_data.values,
-            multioutput=self.error_multioutput,
-        )
+        errors = []
+        segment_values = self.data.loc[:, self.config.segment_columns].drop_duplicates()
+        for _, segment_value in segment_values.iterrows():
+            segment_data = (
+                self.validation_data.query(
+                    " & ".join(
+                        [
+                            f"({col} == {repr(value)})"
+                            for col, value in segment_value.items()
+                        ]
+                    )
+                )
+                .loc[:, [self.config.test_column]]
+                .values.flatten()
+            )
+            error = self.config.error_metric.calculate_error(
+                segment_data,
+                np.array(testing_data.forecast),
+                multioutput=self.error_multioutput,
+            )
+            errors.append(error)
+
+        error = np.mean(errors)
+        logger.debug("Calculated error: %s", error)
         return error
+
+    def get_dataset(
+        self, resize_function: Callable[[pd.DataFrame], pd.DataFrame] = lambda x: x
+    ) -> pd.DataFrame:
+        segment_values = self.data.loc[:, self.config.segment_columns].drop_duplicates()
+        datasets = []
+        for _, segment_value in segment_values.iterrows():
+            logger.debug("Getting dataset for segment: %s", segment_value)
+            segment_data = self.data.query(
+                " & ".join(
+                    [
+                        f"({col} == {repr(value)})"
+                        for col, value in segment_value.items()
+                    ]
+                )
+            ).sort_values(
+                by=self.config.sort_columns,
+                ignore_index=True,
+                ascending=self.config.sort_ascending,
+            )
+            datasets.append(resize_function(segment_data))
+
+        return pd.concat(datasets, axis=0, ignore_index=True).sort_values(
+            by=self.config.sort_columns,
+            ignore_index=True,
+            ascending=self.config.sort_ascending,
+        )
 
     @property
     def training_data(self) -> pd.DataFrame:
-        return self.data.iloc[: -int(self.config.validation_length * len(self.data))]
+        return self.get_dataset(
+            lambda df: df.iloc[: -int(self.config.validation_length * len(df.index))]
+        )
 
     @property
     def validation_data(self) -> pd.DataFrame:
-        return self.data.iloc[-int(self.config.validation_length * len(self.data)) :]
+        return self.get_dataset(
+            lambda df: df.iloc[-int(self.config.validation_length * len(df.index)) :]
+        )
 
     @property
     def grid(self) -> Iterator[AbstractModelWrapperConfig]:
