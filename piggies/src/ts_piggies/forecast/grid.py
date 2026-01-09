@@ -2,7 +2,7 @@ import logging
 import random
 from enum import Enum
 from itertools import islice, product
-from typing import Any, Callable, Dict, Iterator, List, Literal, Self, Type
+from typing import Any, Callable, Dict, Iterator, List, Literal, Self, Tuple, Type
 
 import numpy as np
 import pandas as pd
@@ -77,7 +77,7 @@ class GridSearchConfig(BaseModel):
     sort_ascending: bool = True
     n_simulations: int = 1000
     error_metric: ErrorMetric = ErrorMetric.MAE
-    validation_length: float = Field(default=0.2, ge=0.01, le=0.35)
+    validation_length: float = Field(default=0.1, ge=0.01, le=0.35)
     quantiles: List[float] = [0.1, 0.25, 0.5, 0.75, 0.9]
 
 
@@ -140,13 +140,8 @@ class GridSearch:
             len(training_data.index),
         )
         logger.info("Prediction length: %s for validation.", prediction_length)
-        if random_sample:
-            random.seed(42)
-            shuffled = iter(random.sample(list(self.grid), max_models))
-        else:
-            shuffled = self.grid
 
-        for idx, config in enumerate(islice(shuffled, max_models)):
+        for idx, config in self.get_grid(random_sample, max_models):
             logger.info("Validating iteration %s of %s", idx + 1, max_models or "all")
             model = self.config.model_type(
                 data=training_data,
@@ -194,7 +189,7 @@ class GridSearch:
             )
             errors.append(error)
 
-        error = np.mean(errors)
+        error = np.min(errors)
         logger.debug("Calculated error: %s", error)
         return error
 
@@ -225,6 +220,17 @@ class GridSearch:
             ascending=self.config.sort_ascending,
         )
 
+    def get_grid(
+        self, random_sample: bool = False, max_models: int | None = None
+    ) -> Iterator[Tuple[int, AbstractModelWrapperConfig]]:
+        if random_sample:
+            random.seed(42)
+            shuffled = iter(random.sample(list(self.grid), max_models))
+        else:
+            shuffled = self.grid
+
+        return enumerate(islice(shuffled, max_models))
+
     @property
     def training_data(self) -> pd.DataFrame:
         return self.get_dataset(
@@ -244,3 +250,64 @@ class GridSearch:
         for combination in product(*values):
             config_dict = dict(zip(keys, combination))
             yield self.config.config_type.model_validate(config_dict)
+
+
+class SimulationsGrid(GridSearch):
+    __slots__ = ("simulations",)
+
+    def __init__(
+        self,
+        data: pd.DataFrame,
+        config: GridSearchConfig,
+        error_multioutput: Literal["uniform_average", "raw_values"] = "uniform_average",
+    ):
+        super().__init__(data, config, error_multioutput)
+        self.simulations: List[ProbabilisticForecastResult] | None = None
+
+    def fit_predict(self) -> ProbabilisticForecastResult:
+        if not self.simulations:
+            raise ValueError("No simulations found")
+
+        dates = self.simulations[0].dates
+        n_digits = int(np.log10(len(self.simulations))) + 1
+        results = pd.DataFrame(
+            data={
+                f"fcast_{str(idx + 1).zfill(n_digits)}": model.forecast
+                for idx, model in enumerate(self.simulations)
+            },
+            index=dates,
+        )
+        return ProbabilisticForecastResult(
+            dates=dates,
+            mean=results.mean(axis=1).values.tolist(),
+            median=results.median(axis=1).values.tolist(),
+            std=results.std(axis=1).values.tolist(),
+            quantiles={
+                str(q): results.quantile(q, axis=1).values.tolist()
+                for q in self.config.quantiles
+            },
+            individual_forecasts=self.simulations,
+            n_models=len(self.simulations),
+        )
+
+    def search(
+        self, max_models: int | None = None, random_sample: bool = False
+    ) -> Self:
+        self.simulations = []
+        for idx, config in self.get_grid(random_sample, max_models):
+            logger.info(
+                "Running simulation on iteration %s of %s", idx + 1, max_models or "all"
+            )
+            logger.info("Using config: %s", config)
+            model = self.config.model_type(
+                data=self.data,
+                config=config,
+                max_encoder_length=self.config.max_encoder_length,
+                max_prediction_length=self.config.max_prediction_length,
+                n_simulations=self.config.n_simulations,
+            )
+            self.simulations.append(
+                model.fit_predict(*self.config.quantiles, simulations=False)
+            )
+
+        return self

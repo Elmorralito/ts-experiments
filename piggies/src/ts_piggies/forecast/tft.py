@@ -312,6 +312,103 @@ class TFTForecastWrapper(ForecastModelWrapper):
 
         return samples
 
+    def _format_dates(self, dates: np.ndarray | pd.Series) -> List[str]:
+        """Format dates to ISO format strings"""
+        return [
+            (
+                pd.to_datetime(d).isoformat()
+                if isinstance(d, (pd.Timestamp, np.datetime64))
+                else str(d)
+            )
+            for d in dates
+        ]
+
+    def _get_median_quantile_index(
+        self, predictions_np: np.ndarray, has_quantiles: bool
+    ) -> int:
+        """Get the index of the median quantile in predictions"""
+        if has_quantiles and predictions_np.ndim == 3:
+            if hasattr(self.model, "quantiles") and self.model.quantiles is not None:
+                try:
+                    return list(self.model.quantiles).index(0.5)
+                except ValueError:
+                    pass
+            # Fallback: assume median is the central index
+            return predictions_np.shape[-1] // 2
+        return 0  # Not used for 2D predictions
+
+    def _extract_predictions(
+        self, predictions_np: np.ndarray, median_idx: int
+    ) -> np.ndarray:
+        """Extract predictions from array, handling different shapes"""
+        if predictions_np.ndim == 3:
+            return predictions_np[:, :, median_idx]  # [batch_size, pred_length]
+        elif predictions_np.ndim == 2:
+            return predictions_np  # [batch_size, pred_length]
+        elif predictions_np.ndim == 1:
+            return predictions_np.reshape(1, -1)  # [1, pred_length]
+        else:
+            raise ValueError(f"Unexpected prediction shape: {predictions_np.shape}")
+
+    def _get_model_quantiles(self, predictions_np: np.ndarray) -> np.ndarray:
+        """Extract quantile levels from model or infer from predictions shape"""
+        if hasattr(self.model, "quantiles") and self.model.quantiles is not None:
+            return np.array(self.model.quantiles)
+
+        num_quantiles = predictions_np.shape[2]
+        if num_quantiles == 7:
+            return np.array([0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98])
+        return np.linspace(0.01, 0.99, num_quantiles)
+
+    def _generate_simulations_from_quantiles(
+        self, predictions_np: np.ndarray, model_quantiles: np.ndarray
+    ) -> np.ndarray:
+        """Generate simulations from quantile predictions using vectorized operations"""
+        # predictions_np shape: [batch_size, pred_length, num_quantiles]
+        # Average across series (batch dimension) for each time step and quantile
+        avg_quantile_preds = np.mean(
+            predictions_np, axis=0
+        )  # [pred_length, num_quantiles]
+
+        # Generate all samples at once using vectorized operations
+        pred_length = avg_quantile_preds.shape[0]
+        u = np.random.uniform(
+            0, 1, (self.n_simulations, pred_length)
+        )  # [n_simulations, pred_length]
+
+        # Interpolate for each time step
+        simulations = np.array(
+            [
+                np.interp(u[:, t], model_quantiles, avg_quantile_preds[t, :])
+                for t in range(pred_length)
+            ]
+        ).T  # [n_simulations, pred_length]
+
+        return simulations
+
+    def _generate_simulations_from_deterministic(
+        self, predictions_np: np.ndarray
+    ) -> np.ndarray:
+        """Generate simulations from deterministic predictions using normal distribution"""
+        # Ensure 2D shape: [batch_size, pred_length]
+        if predictions_np.ndim != 2:
+            predictions_np = predictions_np.reshape(-1, predictions_np.shape[-1])
+
+        # Average across series and compute std for each time step
+        mean_preds = np.mean(predictions_np, axis=0)  # [pred_length]
+        std_preds = np.std(predictions_np, axis=0)  # [pred_length]
+        # Avoid zero std
+        std_preds = np.where(std_preds > 0, std_preds, np.abs(mean_preds) * 0.1)
+
+        # Generate samples using vectorized normal distribution
+        simulations = np.random.normal(
+            mean_preds[None, :],
+            std_preds[None, :],
+            (self.n_simulations, len(mean_preds)),
+        )  # [n_simulations, pred_length]
+
+        return simulations
+
     def predict_simulations(
         self, quantiles: Optional[List[float]] = None
     ) -> ProbabilisticForecastResult:
@@ -336,7 +433,7 @@ class TFTForecastWrapper(ForecastModelWrapper):
         model_input, prediction_data, data_sorted = self._prepare_prediction_data()
         unique_series = data_sorted["series_id"].unique()
 
-        # Try to get quantile predictions first
+        # Get model predictions
         predictions_np, has_quantiles = self._get_model_predictions(
             model_input, return_quantiles=True
         )
@@ -346,146 +443,58 @@ class TFTForecastWrapper(ForecastModelWrapper):
             prediction_data["series_id"] == unique_series[0]
         ].sort_values("eom")
         forecast_dates = pd.to_datetime(first_series_pred["eom"].values)
+        formatted_dates = self._format_dates(forecast_dates)
 
+        # Generate simulations based on prediction type
         if has_quantiles and predictions_np.ndim == 3:
-            # We have quantile predictions - use them for sampling
-            # Get quantile levels from model (default: [0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98] for output_size=7)
-            if hasattr(self.model, "quantiles") and self.model.quantiles is not None:
-                model_quantiles = np.array(self.model.quantiles)
-            else:
-                # Default quantiles for QuantileLoss with output_size=7
-                # If we have 7 quantiles, use standard quantiles
-                num_quantiles = predictions_np.shape[2]
-                if num_quantiles == 7:
-                    model_quantiles = np.array([0.02, 0.1, 0.25, 0.5, 0.75, 0.9, 0.98])
-                else:
-                    # Generate evenly spaced quantiles
-                    model_quantiles = np.linspace(0.01, 0.99, num_quantiles)
-
-            pred_length = predictions_np.shape[1]
-
-            # Generate simulations for each time step
-            all_simulations = []
-
-            for t in range(pred_length):
-                # Collect quantile predictions across all series for this time step
-                series_quantile_predictions = []
-
-                for series_idx, series_id in enumerate(unique_series):
-                    if series_idx < predictions_np.shape[0]:
-                        # Get quantile predictions for this series and time step
-                        quantile_preds = predictions_np[
-                            series_idx, t, :
-                        ]  # [num_quantiles]
-                        series_quantile_predictions.append(quantile_preds)
-
-                # Average quantile predictions across series
-                avg_quantile_preds = np.mean(
-                    series_quantile_predictions, axis=0
-                )  # [num_quantiles]
-
-                # Sample from the quantile distribution
-                samples = self._sample_from_quantiles(
-                    avg_quantile_preds, model_quantiles, self.n_simulations
-                )
-                all_simulations.append(samples)
+            model_quantiles = self._get_model_quantiles(predictions_np)
+            simulations_array = self._generate_simulations_from_quantiles(
+                predictions_np, model_quantiles
+            )
         else:
-            # No quantiles available - use Monte Carlo dropout or bootstrap sampling
-            # Get deterministic predictions
-            if predictions_np.ndim == 2:
-                # Shape: [batch_size, pred_length]
-                pred_length = predictions_np.shape[1]
-            else:
-                # Flatten if needed
-                predictions_np = predictions_np.reshape(-1, predictions_np.shape[-1])
-                pred_length = predictions_np.shape[1]
+            simulations_array = self._generate_simulations_from_deterministic(
+                predictions_np
+            )
 
-            # Aggregate predictions across series for each time step
-            all_simulations = []
-
-            for t in range(pred_length):
-                # Collect predictions across all series for this time step
-                series_predictions = []
-                for series_idx, series_id in enumerate(unique_series):
-                    if series_idx < predictions_np.shape[0]:
-                        pred_value = predictions_np[series_idx, t]
-                        series_predictions.append(pred_value)
-
-                # Average across series
-                mean_pred = np.mean(series_predictions)
-                std_pred = (
-                    np.std(series_predictions)
-                    if len(series_predictions) > 1
-                    else abs(mean_pred) * 0.1
-                )
-
-                # Generate samples using bootstrap or normal distribution
-                # Use bootstrap resampling from historical residuals if available, else use normal distribution
-                # For simplicity, use normal distribution with estimated std
-                samples = np.random.normal(mean_pred, std_pred, self.n_simulations)
-                all_simulations.append(samples)
-
-        # Stack simulations: [pred_length, n_simulations]
-        simulations_array = np.array(all_simulations).T  # [n_simulations, pred_length]
-
-        # Compute statistics across simulations
+        # Compute statistics across simulations (vectorized)
         mean_forecast = np.mean(simulations_array, axis=0).tolist()
         median_forecast = np.median(simulations_array, axis=0).tolist()
         std_forecast = np.std(simulations_array, axis=0).tolist()
 
-        # Compute requested quantiles
-        quantile_dict = {}
-        for q in quantiles:
-            quantile_dict[str(q)] = np.quantile(simulations_array, q, axis=0).tolist()
+        # Compute requested quantiles (vectorized)
+        quantile_dict = {
+            str(q): np.quantile(simulations_array, q, axis=0).tolist()
+            for q in quantiles
+        }
 
-        # Create a single ForecastResult for the median (for backward compatibility)
+        # Create ForecastResult for median (backward compatibility)
         median_forecast_result = ForecastResult(
             model_name="TFT",
             config=self.config.model_dump(),
             forecast=median_forecast,
-            dates=[
-                (
-                    pd.to_datetime(d).isoformat()
-                    if isinstance(d, (pd.Timestamp, np.datetime64))
-                    else str(d)
-                )
-                for d in forecast_dates
-            ],
+            dates=formatted_dates,
             train_loss=self.train_loss,
         )
 
         return ProbabilisticForecastResult(
-            dates=[
-                (
-                    pd.to_datetime(d).isoformat()
-                    if isinstance(d, (pd.Timestamp, np.datetime64))
-                    else str(d)
-                )
-                for d in forecast_dates
-            ],
+            dates=formatted_dates,
             mean=mean_forecast,
             median=median_forecast,
             std=std_forecast,
             quantiles=quantile_dict,
-            individual_forecasts=[
-                median_forecast_result
-            ],  # Single model, so one forecast
+            individual_forecasts=[median_forecast_result],
             n_models=1,
         )
 
     def predict(self, quantiles: Optional[List[float]] = None) -> ForecastResult:
         """
-        Generate forecast predictions using n_simulations
-
-        If n_simulations > 1, returns ProbabilisticForecastResult with uncertainty estimates.
-        If n_simulations == 1, returns deterministic ForecastResult (median quantile).
+        Generate deterministic forecast predictions (median quantile)
 
         Args:
-            quantiles: List of quantiles to compute for probabilistic forecast (default: [0.1, 0.25, 0.5, 0.75, 0.9])
-                      Only used when n_simulations > 1
+            quantiles: Not used in this method (kept for interface compatibility)
 
         Returns:
-            ProbabilisticForecastResult if n_simulations > 1, ForecastResult if n_simulations == 1
+            ForecastResult with median predictions
         """
         if self.model is None or self.training_dataset is None:
             raise ValueError(
@@ -500,75 +509,25 @@ class TFTForecastWrapper(ForecastModelWrapper):
             model_input, return_quantiles=False
         )
 
-        # Determine the median quantile index (if quantiles are available)
-        if has_quantiles and predictions_np.ndim == 3:
-            if hasattr(self.model, "quantiles") and 0.5 in self.model.quantiles:
-                median_idx = self.model.quantiles.index(0.5)
-            else:
-                # Fallback: assume median is the central index
-                median_idx = predictions_np.shape[-1] // 2
-        else:
-            median_idx = 0  # Not used for 2D predictions
+        # Get median quantile index and extract predictions
+        median_idx = self._get_median_quantile_index(predictions_np, has_quantiles)
+        predictions_2d = self._extract_predictions(predictions_np, median_idx)
+        # predictions_2d shape: [batch_size, pred_length]
 
-        # Aggregate predictions across all series by date
-        forecast_by_date = {}
+        # Average predictions across all series (vectorized)
+        forecast = np.mean(predictions_2d, axis=0)  # [pred_length]
 
-        # Get the forecast dates from prediction_data
-        for series_idx, series_id in enumerate(unique_series):
-            series_pred_data = prediction_data[
-                prediction_data["series_id"] == series_id
-            ].sort_values("eom")
-            series_dates = pd.to_datetime(series_pred_data["eom"].values)
-
-            # Handle both [batch, pred_len, quantile] and [batch, pred_len]
-            if predictions_np.ndim == 3:
-                series_predictions = predictions_np[series_idx, :, median_idx]
-            elif predictions_np.ndim == 2:
-                series_predictions = predictions_np[series_idx, :]
-            elif predictions_np.ndim == 1:
-                series_predictions = predictions_np
-            else:
-                raise ValueError(f"Unexpected prediction shape: {predictions_np.shape}")
-
-            # Match predictions to dates
-            for i, date in enumerate(series_dates[: len(series_predictions)]):
-                if date not in forecast_by_date:
-                    forecast_by_date[date] = []
-                forecast_by_date[date].append(series_predictions[i])
-
-        # Average forecasts across all series for each date
-        if forecast_by_date:
-            sorted_dates = sorted(forecast_by_date.keys())
-            forecast = np.array(
-                [np.mean(forecast_by_date[date]) for date in sorted_dates]
-            )
-            predicted_dates = np.array(sorted_dates)
-        else:
-            # Fallback: use first series predictions
-            first_series_pred = prediction_data[
-                prediction_data["series_id"] == unique_series[0]
-            ].sort_values("eom")
-            forecast = predictions_np[0, :, median_idx]
-            predicted_dates = pd.to_datetime(first_series_pred["eom"].values)
+        # Get forecast dates from first series (all series have same dates)
+        first_series_pred = prediction_data[
+            prediction_data["series_id"] == unique_series[0]
+        ].sort_values("eom")
+        forecast_dates = pd.to_datetime(first_series_pred["eom"].values)
 
         return ForecastResult(
             model_name="TFT",
             config=self.config.model_dump(),
-            forecast=(
-                forecast.tolist() if isinstance(forecast, np.ndarray) else forecast
-            ),
-            dates=(
-                [
-                    (
-                        pd.to_datetime(d).isoformat()
-                        if isinstance(d, (pd.Timestamp, np.datetime64))
-                        else str(d)
-                    )
-                    for d in predicted_dates
-                ]
-                if isinstance(predicted_dates, np.ndarray)
-                else [str(pd.to_datetime(d)) for d in predicted_dates]
-            ),
+            forecast=forecast.tolist(),
+            dates=self._format_dates(forecast_dates),
             train_loss=self.train_loss,
         )
 
